@@ -28,15 +28,17 @@ const AuditLogsPage = () => {
     'USER_REGISTERED',
     'USER_LOGIN',
     'WALLET_CREATED',
-    'PAYMENT_CREATED',
-    'PAYMENT_QUEUED',
-    'PAYMENT_PROCESSING',
-    'PAYMENT_RETRY',
-    'PAYMENT_SUCCESS',
-    'PAYMENT_FAILED',
     'WALLET_ADJUSTED',
+    'REQUESTED',
+    'QUEUED',
+    'WORKER_CLAIMED',
+    'PROCESSING',
+    'RETRY_SCHEDULED',
+    'SUCCESS',
+    'FAILED',
     'WORKER_FAILURE',
     'WORKER_RECOVERY',
+    'SYSTEM_CONFIG_UPDATE',
   ];
 
   return (

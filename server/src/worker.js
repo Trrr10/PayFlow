@@ -8,7 +8,8 @@ const runWorker = async () => {
   // Connect to MongoDB Atlas (Mandatory)
   await connectDB();
 
-  const workerId = `worker-node-${process.pid}-${Math.random().toString(36).substring(2, 6)}`;
+  // Stable worker ID: use process.env.WORKER_ID if provided, else worker-node-<PID>
+  const workerId = process.env.WORKER_ID || `worker-node-${process.pid}`;
   const worker = new PaymentWorker(workerId);
 
   // NOTE: SIGINT and SIGTERM are handled inside PaymentWorker.start()

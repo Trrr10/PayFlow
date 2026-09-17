@@ -12,7 +12,7 @@ const createPayment = async (req, res) => {
     const senderId = req.user.userId;
     const { recipientId, amount, idempotencyKey } = req.body;
 
-    // Requirement #6 Terminal Log
+    // Terminal Log
     console.log(`[API] Payment request received`);
 
     // 1. Synchronous Input Validation
@@ -44,7 +44,26 @@ const createPayment = async (req, res) => {
       return res.status(400).json({ error: 'Sender and recipient cannot be the same user' });
     }
 
-    // Sender Wallet Balance Pre-Check
+    // 2. IDEMPOTENCY CHECK (Must happen BEFORE balance check)
+    const existingPayment = await Payment.findOne({ senderId, idempotencyKey });
+    if (existingPayment) {
+      const existingJob = await PaymentJob.findOne({ paymentId: existingPayment._id });
+      const statusMessage =
+        existingPayment.status === 'SUCCESS'
+          ? 'Original payment was already completed successfully'
+          : `Payment request already submitted (Status: ${existingPayment.status})`;
+
+      return res.status(200).json({
+        message: statusMessage,
+        isDuplicate: true,
+        paymentId: existingPayment._id,
+        status: existingPayment.status,
+        attempts: existingJob ? existingJob.attempts : existingPayment.attempts,
+        createdAt: existingPayment.createdAt,
+      });
+    }
+
+    // 3. Sender Wallet Balance Pre-Check (Only evaluated for NEW requests)
     const senderWallet = await Wallet.findOne({ userId: senderId });
     const availableBalance = senderWallet ? senderWallet.balance : 0;
     if (availableBalance < numAmount) {
@@ -55,21 +74,7 @@ const createPayment = async (req, res) => {
       });
     }
 
-    // 2. Idempotency Check
-    const existingPayment = await Payment.findOne({ senderId, idempotencyKey });
-    if (existingPayment) {
-      const existingJob = await PaymentJob.findOne({ paymentId: existingPayment._id });
-      return res.status(200).json({
-        message: 'Payment request already submitted (Idempotency Key Matched)',
-        isDuplicate: true,
-        paymentId: existingPayment._id,
-        status: existingPayment.status,
-        attempts: existingJob ? existingJob.attempts : existingPayment.attempts,
-        createdAt: existingPayment.createdAt,
-      });
-    }
-
-    // 3. Create Payment & PaymentJob records synchronously (Status: QUEUED)
+    // 4. Create Payment & PaymentJob records synchronously (Status: QUEUED)
     const payment = await Payment.create({
       senderId,
       recipientId: targetRecipientId,
@@ -88,10 +93,10 @@ const createPayment = async (req, res) => {
       availableAt: new Date(),
     });
 
-    // Requirement #6 Terminal Log
+    // Terminal Log
     console.log(`[API] PaymentJob inserted into MongoDB`);
 
-    // 4. Create Standardized Audit Logs (REQUESTED & QUEUED)
+    // 5. Create Standardized Audit Logs (REQUESTED & QUEUED)
     await AuditLog.create([
       {
         actorId: senderId,
@@ -134,7 +139,7 @@ const createPayment = async (req, res) => {
       });
     }
 
-    // 5. Requirement #6 Terminal Log & HTTP 202 Accepted
+    // 6. Terminal Log & HTTP 202 Accepted
     console.log(`[API] Returning HTTP 202 Accepted`);
     return res.status(202).json({
       message: 'Payment accepted and waiting for the standalone worker.',
@@ -154,7 +159,9 @@ const createPayment = async (req, res) => {
       });
       if (existingPayment) {
         return res.status(200).json({
-          message: 'Payment request already submitted (Idempotency Key Matched)',
+          message: existingPayment.status === 'SUCCESS'
+            ? 'Original payment was already completed successfully'
+            : `Payment request already submitted (Status: ${existingPayment.status})`,
           isDuplicate: true,
           paymentId: existingPayment._id,
           status: existingPayment.status,
@@ -288,27 +295,41 @@ const getPaymentTrace = async (req, res) => {
     }).sort({ createdAt: 1 });
 
     // Map real backend event log objects
-    const timeline = auditLogs.map((log) => ({
-      event: log.action,
-      timestamp: log.createdAt,
-      status: log.metadata?.status || log.action,
-      workerId: log.metadata?.workerId || job?.lockedBy || null,
-      attempt: log.metadata?.attempt || log.metadata?.attempts || (job ? job.attempts : 1),
-      message: log.metadata?.message || null,
-      error: log.metadata?.error || log.metadata?.failureReason || null,
-      details: log.metadata,
-    }));
+    let timeline = auditLogs.map((log) => {
+      const isApiEvent = log.action === 'REQUESTED' || log.action === 'PAYMENT_CREATED' || log.action === 'QUEUED' || log.action === 'PAYMENT_QUEUED';
+      return {
+        event: log.action,
+        timestamp: log.createdAt,
+        status: log.metadata?.status || log.action,
+        workerId: isApiEvent ? null : (log.metadata?.workerId || job?.lockedBy || null),
+        attempt: log.metadata?.attempt || log.metadata?.attempts || (job ? job.attempts : 1),
+        message: log.metadata?.message || null,
+        error: log.metadata?.error || log.metadata?.failureReason || null,
+        details: log.metadata,
+      };
+    });
+
+    // If payment is SUCCESS, truncate timeline at the first SUCCESS event to eliminate post-commit noise
+    const successIndex = timeline.findIndex((t) => t.event === 'SUCCESS' || t.event === 'PAYMENT_SUCCESS');
+    if (successIndex !== -1 && payment.status === 'SUCCESS') {
+      timeline = timeline.slice(0, successIndex + 1);
+    }
 
     // Integrity verification metrics
     const debitCount = transactions.filter((t) => t.type === 'DEBIT').length;
     const creditCount = transactions.filter((t) => t.type === 'CREDIT').length;
+
+    const duplicatePaymentsCount = await Payment.countDocuments({
+      senderId: payment.senderId._id || payment.senderId,
+      idempotencyKey: payment.idempotencyKey,
+    });
 
     const integrity = {
       debitCount,
       creditCount,
       committedPayment: payment.status === 'SUCCESS' ? 1 : 0,
       noDuplicateDebit: debitCount <= 1,
-      idempotencyProtection: 'PASSED',
+      idempotencyProtection: duplicatePaymentsCount <= 1 ? 'ENFORCED' : 'VIOLATED',
       atomicWalletUpdate: payment.status === 'SUCCESS' ? (debitCount === 1 && creditCount === 1 ? 'PASSED' : 'FAILED') : 'PENDING',
       recoveryStatus: job && job.attempts > 1 ? 'PASSED' : 'NOT_REQUIRED',
     };

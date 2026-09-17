@@ -13,12 +13,13 @@ class PaymentWorker {
     this.workerId =
       workerId ||
       process.env.WORKER_ID ||
-      `worker-node-${process.pid}-${Math.floor(1000 + Math.random() * 9000)}`;
+      `worker-node-${process.pid}`;
     this.processId = process.pid;
     this.isRunning = false;
-    this.pollIntervalMs = Number(process.env.WORKER_POLL_INTERVAL) || 1000;
-    this.staleTimeoutMs = Number(process.env.JOB_LOCK_TIMEOUT) || 30000;
+    this.pollIntervalMs = Number(process.env.WORKER_POLL_INTERVAL) || 500;
+    this.staleTimeoutMs = Number(process.env.JOB_LOCK_TIMEOUT) || 5000;
     this.heartbeatIntervalMs = Number(process.env.WORKER_HEARTBEAT_INTERVAL) || 2000;
+    this.recoveryIntervalMs = Number(process.env.WORKER_RECOVERY_INTERVAL) || 2000;
     this.heartbeatTimer = null;
     this.startedAt = new Date();
   }
@@ -65,12 +66,12 @@ class PaymentWorker {
     process.on('SIGINT', () => shutdown('SIGINT'));
     process.on('SIGTERM', () => shutdown('SIGTERM'));
 
-    // Periodically run stale job recovery
+    // Periodically run stale job recovery using configurable recovery interval
     setInterval(async () => {
       if (this.isRunning) {
         await recoverStaleJobs(this.workerId, this.staleTimeoutMs);
       }
-    }, 15000);
+    }, this.recoveryIntervalMs);
 
     this.pollLoop();
   }
@@ -284,7 +285,41 @@ class PaymentWorker {
       payment.attempts = job.attempts;
       await payment.save({ session });
 
-      await PaymentJob.findByIdAndUpdate(job._id, { $set: { status: 'SUCCESS' } }, { session });
+      await PaymentJob.findByIdAndUpdate(
+        job._id,
+        {
+          $set: {
+            status: 'SUCCESS',
+            lockedAt: null,
+            lockedBy: null,
+            completedAt: new Date(),
+          },
+        },
+        { session }
+      );
+
+      // Re-verify WorkerHeartbeat is ONLINE before committing transaction
+      const heartbeatTimeoutMs = Number(process.env.WORKER_HEARTBEAT_TIMEOUT) || 6000;
+      const currentHeartbeat = await WorkerHeartbeat.findOne({ workerId: this.workerId });
+      if (
+        !currentHeartbeat ||
+        currentHeartbeat.status === 'OFFLINE' ||
+        Date.now() - new Date(currentHeartbeat.lastHeartbeat).getTime() > heartbeatTimeoutMs
+      ) {
+        console.warn(`[Worker ${this.workerId}] ⚠️ Worker is OFFLINE or heartbeat expired. Aborting transaction commit!`);
+        await session.abortTransaction();
+        session.endSession();
+
+        // Release job back to QUEUED for another live worker to process
+        await PaymentJob.findByIdAndUpdate(job._id, {
+          $set: { status: 'QUEUED', lockedAt: null, lockedBy: null },
+        });
+
+        await Payment.findByIdAndUpdate(job.paymentId, {
+          $set: { status: 'QUEUED' },
+        });
+        return;
+      }
 
       // Commit MongoDB Transaction
       await session.commitTransaction();
@@ -316,6 +351,26 @@ class PaymentWorker {
         await session.abortTransaction();
       }
       session.endSession();
+
+      // Check if E11000 duplicate key error occurred due to an already-committed transaction
+      const isDuplicateError =
+        error.code === 11000 || (error.message && error.message.includes('E11000'));
+      if (isDuplicateError) {
+        const existingTx = await Transaction.find({ paymentId: job.paymentId });
+        const existingPayment = await Payment.findById(job.paymentId);
+        if (existingTx.length > 0 && existingPayment) {
+          console.log(
+            `[Worker ${this.workerId}] Duplicate execution for completed payment ${job.paymentId}. Preserving SUCCESS state.`
+          );
+          await Payment.findByIdAndUpdate(job.paymentId, {
+            $set: { status: 'SUCCESS', completedAt: existingPayment.completedAt || new Date() },
+          });
+          await PaymentJob.findByIdAndUpdate(job._id, {
+            $set: { status: 'SUCCESS', lockedAt: null, lockedBy: null, completedAt: new Date() },
+          });
+          return;
+        }
+      }
 
       console.error(`[Worker ${this.workerId}] Error processing job ${job._id}:`, error.message);
       await handleJobFailure(job, error, this.workerId);

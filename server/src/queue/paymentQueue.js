@@ -1,9 +1,28 @@
 const PaymentJob = require('../models/PaymentJob');
 const Payment = require('../models/Payment');
 const AuditLog = require('../models/AuditLog');
+const WorkerHeartbeat = require('../models/WorkerHeartbeat');
 
 const claimJob = async (workerId) => {
   try {
+    // 0. Strict Guard: Reject legacy random workers if WORKER_ID env is set
+    if (process.env.WORKER_ID && !workerId.startsWith(process.env.WORKER_ID) && !workerId.startsWith('demo-worker-')) {
+      return null;
+    }
+
+    // 1. Strict Guard: Verify claiming worker is registered and ONLINE in WorkerHeartbeat
+    const timeoutMs = Number(process.env.WORKER_HEARTBEAT_TIMEOUT) || 6000;
+    const heartbeat = await WorkerHeartbeat.findOne({ workerId });
+
+    if (!heartbeat || heartbeat.status === 'OFFLINE') {
+      return null;
+    }
+
+    const timeSinceHeartbeat = Date.now() - new Date(heartbeat.lastHeartbeat).getTime();
+    if (timeSinceHeartbeat > timeoutMs) {
+      return null;
+    }
+
     const job = await PaymentJob.findOneAndUpdate(
       {
         status: 'QUEUED',
@@ -192,32 +211,61 @@ const handleJobFailure = async (job, error, workerId) => {
 const recoverStaleJobs = async (workerId, timeoutMs = 30000) => {
   try {
     const cutoff = new Date(Date.now() - timeoutMs);
-    const staleJobs = await PaymentJob.find({
+    const candidateJobs = await PaymentJob.find({
       status: 'PROCESSING',
       lockedAt: { $lt: cutoff },
     });
 
-    if (staleJobs.length === 0) return 0;
+    if (candidateJobs.length === 0) return 0;
 
-    for (const job of staleJobs) {
+    let recoveredCount = 0;
+
+    for (const job of candidateJobs) {
+      // 1. Check associated Payment record status first
+      const payment = await Payment.findById(job.paymentId);
+      if (!payment || payment.status === 'SUCCESS' || payment.status === 'FAILED') {
+        // Payment is ALREADY terminal! Sync job status and clear lock fields. DO NOT RECOVER!
+        await PaymentJob.findByIdAndUpdate(job._id, {
+          $set: {
+            status: payment ? payment.status : 'FAILED',
+            lockedAt: null,
+            lockedBy: null,
+            completedAt: payment?.completedAt || new Date(),
+          },
+        });
+        continue;
+      }
+
       const abandonedWorker = job.lockedBy;
 
-      await PaymentJob.findByIdAndUpdate(job._id, {
-        $set: {
-          status: 'QUEUED',
-          lockedAt: null,
-          lockedBy: null,
-          availableAt: new Date(),
-          lastError: `Recovered from crashed/stale worker ${abandonedWorker}`,
+      // 2. Atomic findOneAndUpdate to recover ONLY if job status is STILL 'PROCESSING'
+      const recoveredJob = await PaymentJob.findOneAndUpdate(
+        {
+          _id: job._id,
+          status: 'PROCESSING',
+          lockedAt: { $lt: cutoff },
         },
-      });
-
-      await Payment.findByIdAndUpdate(job.paymentId, {
-        $set: {
-          status: 'QUEUED',
+        {
+          $set: {
+            status: 'QUEUED',
+            lockedAt: null,
+            lockedBy: null,
+            availableAt: new Date(),
+            lastError: `Recovered from crashed/stale worker ${abandonedWorker}`,
+          },
         },
-      });
+        { new: true }
+      );
 
+      if (!recoveredJob) continue;
+
+      // 3. Atomically update Payment status to QUEUED if it was PROCESSING
+      await Payment.findOneAndUpdate(
+        { _id: job.paymentId, status: 'PROCESSING' },
+        { $set: { status: 'QUEUED' } }
+      );
+
+      // 4. Audit Log: WORKER_RECOVERY
       await AuditLog.create({
         actorRole: 'WORKER',
         action: 'WORKER_RECOVERY',
@@ -233,12 +281,13 @@ const recoverStaleJobs = async (workerId, timeoutMs = 30000) => {
         },
       });
 
+      recoveredCount++;
       console.log(
         `[Worker ${workerId}] Recovered stale job ${job._id} previously locked by worker ${abandonedWorker}`
       );
     }
 
-    return staleJobs.length;
+    return recoveredCount;
   } catch (error) {
     console.error(`[Worker ${workerId}] Error recovering stale jobs:`, error);
     return 0;

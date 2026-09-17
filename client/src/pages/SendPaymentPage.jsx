@@ -11,6 +11,7 @@ import {
   Zap,
   Users,
   Loader2,
+  Clock,
 } from 'lucide-react';
 
 const SendPaymentPage = () => {
@@ -156,20 +157,22 @@ const SendPaymentPage = () => {
         )}
 
         {responseInfo && (
-          <div className="mb-6 p-4 rounded-xl bg-emerald-500/10 border border-emerald-500/20 text-emerald-300 text-xs space-y-2 font-mono">
-            <div className="flex items-center gap-2 font-bold text-emerald-400 text-sm">
-              <CheckCircle2 className="w-5 h-5" />
+          <div className="mb-6 p-4 rounded-xl bg-amber-500/10 border border-amber-500/20 text-amber-300 text-xs space-y-2 font-mono">
+            <div className="flex items-center gap-2 font-bold text-amber-400 text-sm">
+              <Clock className="w-5 h-5" />
               <span>{responseInfo.message}</span>
             </div>
-            <div>HTTP Response Status: <strong>202 Accepted</strong></div>
+            <div>HTTP Response Status: <strong className="text-emerald-400">202 Accepted</strong></div>
             <div>Payment ID: <strong>{responseInfo.paymentId}</strong></div>
-            <div>Status: <span className="text-amber-400 font-bold">{responseInfo.status}</span></div>
+            <div>Queue Status: <span className="text-amber-400 font-bold">{responseInfo.status}</span></div>
             {responseInfo.isDuplicate && (
-              <div className="p-2 bg-amber-500/20 text-amber-300 rounded border border-amber-500/30">
-                🛡️ <strong>Idempotency Match:</strong> Re-submitted identical key. No second payment created.
+              <div className="p-2 bg-cyan-500/20 text-cyan-300 rounded border border-cyan-500/30 font-sans">
+                🛡️ <strong>Idempotency Match:</strong> Duplicate request returned existing payment record.
               </div>
             )}
-            <div className="text-slate-400 pt-1">Redirecting to PayFlow Trace...</div>
+            <div className="text-slate-400 pt-1 font-sans">
+              Request enqueued in MongoDB Atlas. Opening PayFlow Trace system inspector...
+            </div>
           </div>
         )}
 
